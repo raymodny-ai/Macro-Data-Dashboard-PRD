@@ -2,7 +2,7 @@
 宏观流动性与资产定价状态识别系统 - FastAPI 主入口
 架构原则:
   - SSE 主动推送 (废弃轮询) + Last-Event-ID 断线重连
-  - 事件驱动缓存强驱逐 (Airflow DAG Webhook → Redis DEL → SSE 广播)
+  - 事件驱动缓存强驱逐 (Airflow/Celery Webhook → Redis DEL → SSE 广播)
   - 独立规则引擎热更新 (数据库字典表 → 内存原子替换 → 无重启)
   - CORS 中间件 + OpenAPI 文档
 """
@@ -22,7 +22,7 @@ import redis.asyncio as aioredis
 
 from app.config import get_settings, Settings
 from app.database import get_db, get_redis, engine
-from app.services.cache_manager import CacheManager, TTL_AGGREGATE, TTL_TREND, TTL_REALTIME
+from app.services.cache_manager import CacheManager, TTL_AGGREGATE, TTL_TREND, TTL_REALTIME, TTL_SURFACE
 from app.services.rule_engine import rule_engine
 from app.services.state_engine import compute_dual_track_status
 from app.services import data_service
