@@ -468,12 +468,16 @@ async def cache_invalidate(
     data_group = payload.get("data_group", "*")
     dag_id = payload.get("dag_id", "unknown")
     record_count = payload.get("record_count", 0)
+    changed_fields = payload.get("changed_fields", None)  # 局部刷新字段列表
 
     cache = get_cache_manager()
 
     if data_group == "*":
         # 全量驱逐
         removed = await cache.invalidate_pattern("cache:*")
+    elif changed_fields:
+        # 局部刷新: 仅驱逐指定字段 (减少前端不必要的全屏重绘)
+        removed = await cache.invalidate_partial(data_group, changed_fields)
     else:
         # 按组驱逐 (含仪表板汇总)
         removed = await cache.invalidate_group(data_group)

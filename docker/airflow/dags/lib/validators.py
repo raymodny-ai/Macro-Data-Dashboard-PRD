@@ -191,3 +191,168 @@ def validate_record_count(
         )
         return False
     return True
+
+
+class CircuitBreakerTripped(Exception):
+    """熔断器触发异常: 数据漂移超出安全边界"""
+    def __init__(self, message: str, quarantined: list):
+        super().__init__(message)
+        self.quarantined = quarantined
+
+
+class DataDriftCircuitBreaker:
+    """
+    数据漂移/异常熔断器
+
+    架构原则:
+      - 宏观数据 (SOFR/MOVE/利差) 直接决定风险判定 (绿灯/黄灯/红灯)
+      - 外部 API 返回脏数据 (空值/小数点错误) 可能导致“流动性瘫痪”误报
+      - 入库前强边界校验: 超出安全阈值的记录先进入“人工复核池” (隔离队列)
+
+    安全边界参考 (历史极值 × 1.5 宽限):
+      - SOFR: [-0.50%, 6.00%]  (2020负值 + 2023高位)
+      - IORB: [-0.50%, 6.00%]
+      - SOFR-IORB spread: [-1.00%, 1.00%]  (正常 ±20bp, 极端 ±100bp)
+      - MOVE index: [30, 300]  (历史区间 30~200, 极端 250+)
+      - CPI MoM: [-2.0%, +2.0%]  (月环比极端值)
+      - Bid-to-cover: [0.5, 10.0]  (拍卖认购倍数)
+    """
+
+    # 安全边界: {field_name: (min, max)}
+    DEFAULT_BOUNDS = {
+        'sofr_rate': (-0.50, 6.00),
+        'iorb_rate': (-0.50, 6.00),
+        'spread': (-1.00, 1.00),
+        'move_index': (30.0, 300.0),
+        'mom_growth': (-2.0, 2.0),
+        'acceleration': (-2.0, 2.0),
+        'bid_to_cover_ratio': (0.5, 10.0),
+        'close_price': (0.01, 100000.0),
+        'value': (-10.0, 100.0),  # 通用收益率字段
+    }
+
+    def __init__(self, custom_bounds: Optional[dict] = None):
+        self.bounds = {**self.DEFAULT_BOUNDS}
+        if custom_bounds:
+            self.bounds.update(custom_bounds)
+        self._trip_count = 0
+
+    def check_record(
+        self,
+        record: Dict[str, Any],
+        strict_fields: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """
+        单条记录边界校验
+
+        Args:
+            record: 数据记录字典
+            strict_fields: 仅校验指定字段 (默认全部已定义字段)
+
+        Returns:
+            None 表示通过; 否则返回违规描述
+        """
+        violations = []
+        fields = strict_fields or list(self.bounds.keys())
+
+        for field in fields:
+            if field not in self.bounds:
+                continue
+            val = record.get(field)
+            if val is None:
+                continue
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                violations.append(f"{field}={record.get(field)} is not numeric")
+                continue
+
+            lo, hi = self.bounds[field]
+            if not (lo <= val <= hi):
+                violations.append(
+                    f"{field}={val:.6f} outside [{lo}, {hi}]"
+                )
+
+        if violations:
+            return "; ".join(violations)
+        return None
+
+    def check_batch(
+        self,
+        records: List[Dict[str, Any]],
+        max_drift_pct: float = 0.05,
+        strict_fields: Optional[List[str]] = None,
+    ) -> tuple:
+        """
+        批量记录边界校验 + 熔断
+
+        Args:
+            records: 记录列表
+            max_drift_pct: 最大允许漂移比例 (超出则熔断)
+            strict_fields: 仅校验指定字段
+
+        Returns:
+            (通过记录, 隔离记录, 报告字典)
+
+        Raises:
+            CircuitBreakerTripped: 当漂移比例超过 max_drift_pct 时触发
+        """
+        passed = []
+        quarantined = []
+
+        for rec in records:
+            violation = self.check_record(rec, strict_fields)
+            if violation is None:
+                passed.append(rec)
+            else:
+                rec['_drift_reason'] = violation
+                quarantined.append(rec)
+                logger.warning(
+                    f"DRIFT QUARANTINE: {violation} "
+                    f"| date={rec.get('record_date', rec.get('trade_date', 'N/A'))}"
+                )
+
+        total = len(records)
+        drift_pct = len(quarantined) / total if total > 0 else 0.0
+
+        report = {
+            'total': total,
+            'passed': len(passed),
+            'quarantined': len(quarantined),
+            'drift_pct': round(drift_pct, 4),
+            'circuit_tripped': drift_pct > max_drift_pct,
+        }
+
+        if drift_pct > max_drift_pct:
+            self._trip_count += 1
+            msg = (
+                f"CIRCUIT BREAKER TRIPPED: {len(quarantined)}/{total} "
+                f"({drift_pct:.1%}) records drifted (threshold: {max_drift_pct:.1%}). "
+                f"Cumulative trips: {self._trip_count}. "
+                f"Quarantined records sent to manual review pool."
+            )
+            logger.critical(msg)
+            raise CircuitBreakerTripped(msg, quarantined)
+
+        logger.info(
+            f"Drift check passed: {len(passed)}/{total} OK, "
+            f"{len(quarantined)} quarantined ({drift_pct:.1%})"
+        )
+        return passed, quarantined, report
+
+    @property
+    def trip_count(self) -> int:
+        """累计熔断次数 (监控指标)"""
+        return self._trip_count
+
+
+# 全局熔断器实例
+liquidity_circuit_breaker = DataDriftCircuitBreaker(
+    custom_bounds={
+        # 流动性走廊专用: 更严格的利差边界
+        'spread': (-0.50, 0.50),  # ±50bp (100bp突变则熔断)
+    }
+)
+
+market_circuit_breaker = DataDriftCircuitBreaker()
+inflation_circuit_breaker = DataDriftCircuitBreaker()

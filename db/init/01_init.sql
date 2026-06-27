@@ -22,7 +22,10 @@ CREATE TABLE IF NOT EXISTS inflation_data (
     CONSTRAINT uq_inflation UNIQUE (record_date, symbol)
 );
 
-SELECT create_hypertable('inflation_data', 'record_date', if_not_exists => TRUE);
+SELECT create_hypertable('inflation_data', 'record_date',
+    if_not_exists => TRUE,
+    chunk_time_interval => INTERVAL '1 month'  -- 月频数据, 按月分区
+);
 
 -- =============================================================================
 -- 2. fiscal_auction_data: 财政增量组
@@ -41,7 +44,10 @@ CREATE TABLE IF NOT EXISTS fiscal_auction_data (
     CONSTRAINT uq_fiscal UNIQUE (auction_date, security_type)
 );
 
-SELECT create_hypertable('fiscal_auction_data', 'auction_date', if_not_exists => TRUE);
+SELECT create_hypertable('fiscal_auction_data', 'auction_date',
+    if_not_exists => TRUE,
+    chunk_time_interval => INTERVAL '3 months'  -- 季频拍卖, 按季分区
+);
 
 -- =============================================================================
 -- 3. liquidity_corridor: 流动性走廊组
@@ -59,7 +65,10 @@ CREATE TABLE IF NOT EXISTS liquidity_corridor (
     CONSTRAINT uq_liquidity UNIQUE (record_date, symbol)
 );
 
-SELECT create_hypertable('liquidity_corridor', 'record_date', if_not_exists => TRUE);
+SELECT create_hypertable('liquidity_corridor', 'record_date',
+    if_not_exists => TRUE,
+    chunk_time_interval => INTERVAL '1 month'  -- 日频数据, 按月分区
+);
 
 -- =============================================================================
 -- 4. ai_capex_data: AI 资本开支组
@@ -77,7 +86,10 @@ CREATE TABLE IF NOT EXISTS ai_capex_data (
     CONSTRAINT uq_ai_capex UNIQUE (report_date, company_cik)
 );
 
-SELECT create_hypertable('ai_capex_data', 'report_date', if_not_exists => TRUE);
+SELECT create_hypertable('ai_capex_data', 'report_date',
+    if_not_exists => TRUE,
+    chunk_time_interval => INTERVAL '1 year'  -- 季频财报, 按年分区
+);
 
 -- =============================================================================
 -- 5. market_contagion: 市场传染组
@@ -96,7 +108,10 @@ CREATE TABLE IF NOT EXISTS market_contagion (
     CONSTRAINT uq_contagion UNIQUE (trade_date, symbol)
 );
 
-SELECT create_hypertable('market_contagion', 'trade_date', if_not_exists => TRUE);
+SELECT create_hypertable('market_contagion', 'trade_date',
+    if_not_exists => TRUE,
+    chunk_time_interval => INTERVAL '1 month'  -- 日频交易, 按月分区
+);
 
 -- =============================================================================
 -- 索引优化
@@ -113,7 +128,7 @@ CREATE INDEX IF NOT EXISTS idx_contagion_alert ON market_contagion (contagion_al
 -- 连续聚合视图 (按需刷新, 由 Airflow DAG 完成后触发 refresh_continuous_aggregate)
 -- =============================================================================
 
--- SOFR-IORB 利差 30日/90日历史分位数
+-- 1) SOFR-IORB 利差 30日/90日历史分位数
 CREATE MATERIALIZED VIEW IF NOT EXISTS spread_percentiles_30d
 WITH (timescaledb.continuous) AS
 SELECT
@@ -126,6 +141,118 @@ FROM liquidity_corridor
 WHERE symbol = 'SPREAD'
 GROUP BY bucket
 WITH NO DATA;
+
+-- 2) 通胀 3MMA + 环比 + 加速度 (核心 CPI)
+-- 将原应用层(data_service.py)计算下推到 TimescaleDB 增量预聚合
+CREATE MATERIALIZED VIEW IF NOT EXISTS inflation_monthly_agg
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 month', record_date) AS bucket,
+    symbol,
+    AVG(value) AS avg_value,
+    AVG(mom_growth) AS avg_mom_growth,
+    AVG(acceleration) AS avg_acceleration,
+    AVG(three_mma) AS avg_three_mma,
+    BOOL_OR(warning_flag) AS any_warning
+FROM inflation_data
+GROUP BY bucket, symbol
+WITH NO DATA;
+
+-- 3) 利差日频聚合 (均值/极值/状态分布)
+CREATE MATERIALIZED VIEW IF NOT EXISTS spread_daily_agg
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 day', record_date) AS bucket,
+    AVG(spread) AS avg_spread,
+    MIN(spread) AS min_spread,
+    MAX(spread) AS max_spread,
+    MODE() WITHIN GROUP (ORDER BY system_state) AS dominant_state,
+    BOOL_OR(crisis_alert) AS any_crisis
+FROM liquidity_corridor
+WHERE symbol = 'SPREAD'
+GROUP BY bucket
+WITH NO DATA;
+
+-- 4) 市场传染日频聚合 (MOVE均值/相关系数均值)
+CREATE MATERIALIZED VIEW IF NOT EXISTS contagion_daily_agg
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 day', trade_date) AS bucket,
+    AVG(move_index) AS avg_move_index,
+    AVG(rolling_corr_30d) AS avg_corr_30d,
+    AVG(rolling_corr_60d) AS avg_corr_60d,
+    BOOL_OR(contagion_alert) AS any_contagion
+FROM market_contagion
+WHERE symbol = 'SPY'
+GROUP BY bucket
+WITH NO DATA;
+
+-- 5) 国债收益率月频聚合 (各期限均值/标准差)
+CREATE MATERIALIZED VIEW IF NOT EXISTS treasury_yield_monthly
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 month', record_date) AS bucket,
+    symbol,
+    AVG(value) AS avg_yield,
+    STDDEV(value) AS std_yield,
+    MIN(value) AS min_yield,
+    MAX(value) AS max_yield
+FROM treasury_yields
+GROUP BY bucket, symbol
+WITH NO DATA;
+
+-- =============================================================================
+-- 数据生命周期管理 (Retention Policies)
+-- 控制存储成本: 陈旧数据自动压缩/清理
+-- =============================================================================
+
+-- 高频日频数据: 保留 3 年 (超过后自动删除)
+SELECT add_retention_policy('market_contagion', INTERVAL '3 years', if_not_exists => TRUE);
+SELECT add_retention_policy('liquidity_corridor', INTERVAL '5 years', if_not_exists => TRUE);
+SELECT add_retention_policy('treasury_yields', INTERVAL '5 years', if_not_exists => TRUE);
+
+-- 低频月/季频数据: 保留 10 年
+SELECT add_retention_policy('inflation_data', INTERVAL '10 years', if_not_exists => TRUE);
+SELECT add_retention_policy('fiscal_auction_data', INTERVAL '10 years', if_not_exists => TRUE);
+SELECT add_retention_policy('ai_capex_data', INTERVAL '10 years', if_not_exists => TRUE);
+
+-- 连续聚合自动刷新策略 (每日增量刷新最近 7 天数据)
+SELECT add_continuous_aggregate_policy('spread_percentiles_30d',
+    start_offset => INTERVAL '30 days',
+    end_offset => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '1 day',
+    if_not_exists => TRUE);
+
+SELECT add_continuous_aggregate_policy('inflation_monthly_agg',
+    start_offset => INTERVAL '3 months',
+    end_offset => INTERVAL '1 day',
+    schedule_interval => INTERVAL '1 day',
+    if_not_exists => TRUE);
+
+SELECT add_continuous_aggregate_policy('spread_daily_agg',
+    start_offset => INTERVAL '7 days',
+    end_offset => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '1 day',
+    if_not_exists => TRUE);
+
+SELECT add_continuous_aggregate_policy('contagion_daily_agg',
+    start_offset => INTERVAL '7 days',
+    end_offset => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '1 day',
+    if_not_exists => TRUE);
+
+SELECT add_continuous_aggregate_policy('treasury_yield_monthly',
+    start_offset => INTERVAL '3 months',
+    end_offset => INTERVAL '1 day',
+    schedule_interval => INTERVAL '1 day',
+    if_not_exists => TRUE);
+
+-- 陈旧数据压缩策略: 超过 1 年的 chunk 自动压缩 (只读)
+SELECT add_compression_policy('inflation_data', INTERVAL '1 year', if_not_exists => TRUE);
+SELECT add_compression_policy('liquidity_corridor', INTERVAL '1 year', if_not_exists => TRUE);
+SELECT add_compression_policy('market_contagion', INTERVAL '6 months', if_not_exists => TRUE);
+SELECT add_compression_policy('treasury_yields', INTERVAL '1 year', if_not_exists => TRUE);
+SELECT add_compression_policy('ai_capex_data', INTERVAL '2 years', if_not_exists => TRUE);
 
 -- =============================================================================
 -- 数据库维护日志表 (VACUUM ANALYZE DAG 写入)
@@ -200,7 +327,10 @@ CREATE TABLE IF NOT EXISTS treasury_yields (
     CONSTRAINT uq_treasury_yield UNIQUE (record_date, symbol)
 );
 
-SELECT create_hypertable('treasury_yields', 'record_date', if_not_exists => TRUE);
+SELECT create_hypertable('treasury_yields', 'record_date',
+    if_not_exists => TRUE,
+    chunk_time_interval => INTERVAL '1 month'  -- 日频收益率, 按月分区
+);
 
 CREATE INDEX IF NOT EXISTS idx_treasury_yield_date ON treasury_yields (record_date DESC);
 CREATE INDEX IF NOT EXISTS idx_treasury_yield_symbol ON treasury_yields (symbol, record_date DESC);

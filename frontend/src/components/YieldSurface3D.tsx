@@ -14,6 +14,7 @@ interface YieldSurfaceProps {
   data: number[][] | null; // [time_index][term_index] = yield_value
   terms?: string[];        // ['1M', '3M', ..., '30Y']
   dates?: string[];        // ['2024-01-01', ...]
+  onPerformanceDegraded?: () => void; // 运行时帧率过低回调 (触发父组件切换到 2D)
 }
 
 export const YieldSurface3D: React.FC<YieldSurfaceProps> = ({
@@ -30,6 +31,8 @@ export const YieldSurface3D: React.FC<YieldSurfaceProps> = ({
   const frameCountRef = useRef(0);
   const lastTimeRef = useRef(performance.now());
   const fpsRef = useRef(60);
+  const lowFpsCountRef = useRef(0); // 连续低帧率计数器
+  const degradedRef = useRef(false); // 是否已触发降级
   const [fps, setFps] = useState(60);
 
   // LOD 配置
@@ -115,6 +118,18 @@ export const YieldSurface3D: React.FC<YieldSurfaceProps> = ({
 
         frameCountRef.current = 0;
         lastTimeRef.current = now;
+
+        // 运行时降级检测: 连续 5 秒 FPS < 15 则触发父组件切换
+        if (currentFps < 15 && !degradedRef.current) {
+          lowFpsCountRef.current++;
+          if (lowFpsCountRef.current >= 5) {
+            degradedRef.current = true;
+            console.warn('[YieldSurface3D] Sustained low FPS detected, triggering 2D fallback');
+            onPerformanceDegraded?.();
+          }
+        } else {
+          lowFpsCountRef.current = 0;
+        }
       }
     };
 

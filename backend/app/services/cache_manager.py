@@ -99,6 +99,63 @@ class CacheManager:
             total += await self.invalidate_pattern(pattern)
         return total
 
+    async def invalidate_partial(
+        self,
+        data_group: str,
+        changed_fields: Optional[list] = None,
+    ) -> int:
+        """
+        局部缓存刷新 (Partial Invalidation)
+        架构原则:
+          - 双轨矩阵场景: 仅对发生变动的特定指标进行局部刷新
+          - 配合 SSE 向前端定向推送变更字段, 减少不必要的全屏重绘
+
+        Args:
+            data_group: 数据组 (liquidity/inflation/dual_track/...)
+            changed_fields: 变更字段列表 (None 则降级为全组刷新)
+
+        Returns:
+            被驱逐的缓存 key 数量
+        """
+        if changed_fields is None:
+            # 无指定字段 → 降级为全组刷新
+            return await self.invalidate_group(data_group)
+
+        total = 0
+        for field in changed_fields:
+            key = self._key(data_group, field)
+            exists = await self._redis.exists(key)
+            if exists:
+                await self._redis.delete(key)
+                total += 1
+                logger.info(f"Partial INVALIDATE: {key}")
+
+        # 仪表板汇总依赖所有组, 局部变更仍需刷新
+        if data_group != "dashboard":
+            total += await self.invalidate_pattern("cache:dashboard:*")
+
+        return total
+
+    async def set_partial(
+        self,
+        data_group: str,
+        field: str,
+        value: Any,
+        ttl: timedelta = TTL_TREND,
+    ):
+        """
+        局部缓存写入 (Partial Set)
+        用于增量更新单个指标而非整组重写
+
+        Args:
+            data_group: 数据组
+            field: 指标字段名
+            value: 缓存值
+            ttl: 过期时间
+        """
+        await self.set(data_group, field, value, ttl)
+        logger.debug(f"Partial SET: cache:{data_group}:{field}")
+
     async def get_or_compute(
         self,
         namespace: str,
