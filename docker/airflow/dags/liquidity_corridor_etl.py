@@ -324,6 +324,13 @@ with DAG(
         )
         logger.info("Continuous aggregate 'spread_percentiles_30d' refreshed")
 
+        refresh_continuous_aggregate(
+            view_name='spread_daily_agg',
+            start_date=date_range['start_date'],
+            end_date=date_range['end_date'],
+        )
+        logger.info("Continuous aggregate 'spread_daily_agg' refreshed")
+
     # ========================================================================
     # Task 8: 发射 Webhook (缓存强驱逐 + SSE 广播)
     # ========================================================================

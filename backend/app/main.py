@@ -491,7 +491,7 @@ async def cache_invalidate(
     }
 
     # 判断是否需要推送状态变更事件
-    if data_group in ("liquidity", "inflation", "fiscal", "contagion"):
+    if data_group in ("liquidity", "inflation", "fiscal", "contagion", "treasury_yield"):
         await sse_broadcaster.broadcast("data_updated", event_data)
     else:
         await sse_broadcaster.broadcast("cache_invalidated", event_data)

@@ -20,7 +20,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from lib.db_utils import push_calculated_results, send_completion_webhook
+from lib.db_utils import push_calculated_results, send_completion_webhook, refresh_continuous_aggregate
 from lib.rate_limiter import fred_rate_limiter
 from lib.calculators.inflation_acceleration import process_inflation_group
 
@@ -160,7 +160,25 @@ with DAG(
         return count
 
     # ====================================================================
-    # Task 6: 发射 Webhook
+    # Task 6: 按需刷新连续聚合视图
+    # ====================================================================
+    def refresh_aggregates(**kwargs):
+        """
+        精准重建 T-180 窗口的连续聚合视图
+        架构原则: 按需刷新, 非全量重算
+        """
+        ti = kwargs['ti']
+        date_range = ti.xcom_pull(task_ids='compute_date_range', key='date_range')
+
+        refresh_continuous_aggregate(
+            view_name='inflation_monthly_agg',
+            start_date=date_range['start_date'],
+            end_date=date_range['end_date'],
+        )
+        logger.info("Continuous aggregate 'inflation_monthly_agg' refreshed")
+
+    # ====================================================================
+    # Task 7: 发射 Webhook
     # ====================================================================
     def emit_webhook(**kwargs):
         ti = kwargs['ti']
@@ -179,6 +197,7 @@ with DAG(
     t3 = PythonOperator(task_id='compute_acceleration', python_callable=compute_acceleration)
     t4 = ShortCircuitOperator(task_id='quality_gate', python_callable=quality_gate)
     t5 = PythonOperator(task_id='upsert_inflation_data', python_callable=upsert_inflation_data)
-    t6 = PythonOperator(task_id='emit_webhook', python_callable=emit_webhook)
+    t6 = PythonOperator(task_id='refresh_aggregates', python_callable=refresh_aggregates)
+    t7 = PythonOperator(task_id='emit_webhook', python_callable=emit_webhook)
 
-    t1 >> t2 >> t3 >> t4 >> t5 >> t6
+    t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7
