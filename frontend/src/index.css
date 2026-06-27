@@ -1,0 +1,33 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-neon-blue: #00d4ff;
+  --color-neon-green: #00ff88;
+  --color-neon-yellow: #ffcc00;
+  --color-neon-red: #ff3366;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #0a0e17;
+  color: #e5e7eb;
+  overflow: hidden;
+}
+
+/* 自定义滚动条 */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #111827;
+}
+::-webkit-scrollbar-thumb {
+  background: #374151;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #4b5563;
+}

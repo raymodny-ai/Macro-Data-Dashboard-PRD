@@ -1,0 +1,268 @@
+# =============================================================================
+# 宏观流动性与资产定价状态识别系统 - Docker Compose 全栈编排
+# 架构原则: 全栈容器化本地部署, 8 个应用服务 + 网络隔离
+# =============================================================================
+version: "3.9"
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./docker/airflow
+    dockerfile: Dockerfile
+  env_file: .env
+  environment: &airflow-env
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: ${AIRFLOW__CORE__SQL_ALCHEMY_CONN}
+    AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR:-LocalExecutor}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__CATCHUP_BY_DEFAULT: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+    POSTGRES_HOST: timescaledb
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: ${POSTGRES_DB}
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    FRED_API_KEY: ${FRED_API_KEY}
+    ALPHA_VANTAGE_KEY: ${ALPHA_VANTAGE_KEY}
+    SEC_USER_AGENT: ${SEC_USER_AGENT}
+    REDIS_URL: ${REDIS_URL}
+    WEBHOOK_URL: ${WEBHOOK_URL}
+    WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+  volumes:
+    - ./docker/airflow/dags:/opt/airflow/dags
+    - ./docker/airflow/logs:/opt/airflow/logs
+    - ./docker/airflow/plugins:/opt/airflow/plugins
+  networks:
+    - macro_net
+  depends_on:
+    timescaledb:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  # ===========================================================================
+  # 1. TimescaleDB (核心存储引擎)
+  # ===========================================================================
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+      - backup_data:/backups
+    command:
+      - "postgres"
+      - "-c"
+      - "archive_mode=on"
+      - "-c"
+      - "archive_command=cp %p /backups/wal_archive/%f"
+      - "-c"
+      - "max_wal_senders=3"
+      - "-c"
+      - "wal_level=replica"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - macro_net
+
+  # ===========================================================================
+  # 2. Redis (缓存 + 令牌桶限流器 + Celery Broker)
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - macro_net
+
+  # ===========================================================================
+  # 3. Airflow Webserver
+  # ===========================================================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@local || true &&
+        airflow webserver --port 8080
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ===========================================================================
+  # 4. Airflow Scheduler
+  # ===========================================================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    restart: unless-stopped
+    command: airflow scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $(hostname)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ===========================================================================
+  # 5. Airflow Worker (宽容接口: FRED / Fiscal Data)
+  #    架构原则: 双层限流隔离 - 宽容接口直接在 Worker 中处理
+  # ===========================================================================
+  airflow-worker:
+    <<: *airflow-common
+    container_name: airflow-worker
+    restart: unless-stopped
+    command: airflow celery worker
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type CeleryWorker --hostname $(hostname)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ===========================================================================
+  # 6. Celery Worker (严格限流: SEC EDGAR ≤10次/秒)
+  #    架构原则: 双层限流隔离 - 严苛接口剥离至独立队列 + Redis 令牌桶
+  # ===========================================================================
+  celery-worker:
+    build:
+      context: ./celery-worker
+      dockerfile: Dockerfile
+    container_name: celery-worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+      POSTGRES_HOST: timescaledb
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SEC_USER_AGENT: ${SEC_USER_AGENT}
+      REDIS_URL: ${REDIS_URL}
+    volumes:
+      - ./celery-worker/app:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.worker inspect ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - macro_net
+
+  # ===========================================================================
+  # 7. FastAPI (后端通信层 + SSE 主动推送)
+  # ===========================================================================
+  fastapi:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fastapi
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_URL_SYNC: ${DATABASE_URL_SYNC}
+      REDIS_URL: ${REDIS_URL}
+      FASTAPI_HOST: "0.0.0.0"
+      FASTAPI_PORT: "8000"
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/app:/app
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - macro_net
+
+  # ===========================================================================
+  # 8. Frontend (React + Vite 大屏)
+  # ===========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+      VITE_SSE_URL: ${VITE_SSE_URL:-http://localhost:8000/api/v1/events/stream}
+    ports:
+      - "3000:5173"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+    depends_on:
+      fastapi:
+        condition: service_healthy
+    networks:
+      - macro_net
+
+# =============================================================================
+# 网络隔离
+# =============================================================================
+networks:
+  macro_net:
+    driver: bridge
+    name: macro_dashboard_network
+
+# =============================================================================
+# 持久化数据卷
+# =============================================================================
+volumes:
+  timescaledb_data:
+    driver: local
+  redis_data:
+    driver: local
+  backup_data:
+    driver: local

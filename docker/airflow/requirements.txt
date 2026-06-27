@@ -1,0 +1,15 @@
+# Airflow Worker 依赖 (ETL DAG 任务)
+apache-airflow==2.8.1
+pandas>=2.1.4
+numpy>=1.26.2
+yfinance>=0.2.33
+requests>=2.31.0
+psycopg2-binary>=2.9.9
+fredapi>=0.5.1
+redis>=5.0.1
+python-dotenv>=1.0.0
+httpx>=0.25.2
+lxml>=5.1.0
+beautifulsoup4>=4.12.2
+pytest>=7.4.4
+scipy>=1.11.4
